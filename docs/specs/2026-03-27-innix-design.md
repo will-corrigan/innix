@@ -217,8 +217,10 @@ let
 
   programImport = name: value:
     let
-      level = if builtins.isString value then value else value.config or "minimal";
+      level = value.config or (builtins.throw "host.programs.${name}: missing required 'config' field");
     in
+    assert level == "curated" || level == "minimal"
+      || builtins.throw "host.programs.${name}: config must be 'curated' or 'minimal', got '${level}'";
     if level == "curated"
     then ../dotfiles/curated/${name}.nix
     else ../dotfiles/minimal/${name}.nix;
@@ -349,7 +351,34 @@ Curated configs shipped with innix are genuinely universal. They are NOT copied 
 
 ## macOS Defaults
 
-Only settings the user explicitly chooses get written to `common.nix`. Everything else stays at macOS system defaults. No hardcoded opinions.
+Only settings the user explicitly chooses get written to `common.nix`. Everything else stays at macOS system defaults. No hardcoded opinions. Zero unconditional system.defaults — if `[macos]` is empty or absent, no macOS preferences are set.
+
+### How common.nix.tmpl works
+
+`common.nix` is the only Go-templated Nix file (besides schema.json). The Go template conditionally emits sections:
+
+```
+{{ if .Macos.Keyboard }}
+  system.keyboard = {
+    enableKeyMapping = true;
+    {{ if .Macos.Keyboard.CapsLock }}
+    remapCapsLockToEscape = {{ eq .Macos.Keyboard.CapsLock "escape" }};
+    {{ end }}
+  };
+{{ end }}
+
+{{ if .Macos.Dock }}
+  system.defaults.dock = {
+    {{ if .Macos.Dock.AutoHide }}autohide = {{ .Macos.Dock.AutoHide }};{{ end }}
+    {{ if .Macos.Dock.Position }}orientation = "{{ .Macos.Dock.Position }}";{{ end }}
+    ...
+  };
+{{ end }}
+```
+
+Each `[macos.*]` TOML section maps to a conditional block. Only sections with at least one key set produce Nix output. Value mapping (e.g., `key_repeat = "fast"` -> `KeyRepeat = 1`) is handled in Go before template rendering, not in the Nix template itself.
+
+The Stylix, Nix settings, and shell enablement sections are always emitted (they're framework requirements, not user preferences).
 
 The TUI groups settings into digestible categories:
 
@@ -419,9 +448,13 @@ Nix is the package manager that makes this work.
 
 **Shell restart handling:** If Nix installation requires a shell restart (it modifies `/etc/zshrc`), the wizard saves progress to a temporary file, tells the user to restart their terminal, and on next `innix` run detects the partial state and resumes from where it left off.
 
-### Step 2: Your machine
+### Step 2: Your machine & identity
 
-Auto-detect from `scutil --get LocalHostName`, `uname -m`, `$USER`. Confirm with user. Friendly wording — no "hostname" or "platform".
+Auto-detect machine info from `scutil --get LocalHostName`, `uname -m`, `$USER`. Confirm with user. Friendly wording — no "hostname" or "platform".
+
+Also collects user identity (always needed, not just for git):
+- "What name should appear on commits?" (text input)
+- "What email?" (text input)
 
 ### Step 3: Appearance
 
@@ -458,7 +491,7 @@ Development
                    Learn more: https://mise.jdx.dev
 ```
 
-Global vim toggle at the top of the Development section:
+Global vim toggle at the top of the programs step (before all categories):
 
 ```
   [x] Vim keybindings (applies to zsh, btop, zed, tmux)
@@ -482,8 +515,9 @@ Per-program vim override shown when relevant:
               Vim keybindings: ON (change)
 ```
 
+**User identity:** `[user]` (name, email) is always collected in Step 2 since it's needed for git config even in minimal mode. The git program follow-up only triggers the SSH signing question.
+
 **Contextual follow-ups:**
-- git selected -> "Name for commits?" / "Email?"
 - git selected -> "Sign commits with SSH keys?" -> integrations step
 
 **Dependency hints:**
@@ -517,7 +551,7 @@ Extra Homebrew formulae? (comma-separated, enter to skip)
   Browse: https://formulae.brew.sh/formula/
 ```
 
-Homebrew names validated cheaply via `brew info`. Nixpkgs names validated at build time with clear error message.
+Homebrew and nixpkgs names are not validated by the TUI — they are validated at build time. Invalid names produce clear error messages pointing to the relevant search URLs.
 
 ### Step 7: macOS preferences
 
@@ -531,7 +565,7 @@ Show full config. All answers collected up to this point — nothing written yet
   [Save & build]    [Edit]    [Cancel]
 ```
 
-**Atomic write:** All files written at once. If interrupted during write, next `innix` run detects partial state (has `.innix-version` but missing key files) and offers to re-scaffold.
+**Sequential write:** All wizard answers collected first, then all files written sequentially without user interaction. If interrupted during write, next `innix` run detects partial state (has `.innix-version` but missing key files) and offers to re-scaffold.
 
 Save: writes all files, `git init`, initial commit, offers first build.
 
@@ -580,7 +614,7 @@ innix detected an existing configuration.
 
 1. User selects installed program
 2. innix removes `[programs.<name>]` from selected host TOML
-3. innix scans all other host TOMLs — if no host references this program, deletes the dotfile pair
+3. innix scans all other host TOMLs — if no host references this program, deletes the dotfile pair. **Safety: if any TOML fails to parse, refuse to delete dotfiles and warn the user.** Safer to leave orphaned dotfiles than to delete files another host needs.
 4. innix regenerates `schema.json`
 5. User rebuilds
 
@@ -594,13 +628,66 @@ Future (v2): `innix diff <program>` shows what changed between user's version an
 
 ---
 
+## Program Catalog (embedded in Go binary)
+
+innix's knowledge of available programs lives in a Go struct embedded in the binary:
+
+```go
+type Program struct {
+    Name         string   // "zsh" — used as TOML key and dotfile filename
+    Description  string   // "Shell with history, completions, and syntax highlighting"
+    Category     string   // "shell", "editor", "cli", "dev"
+    SupportsVim  bool     // true for zsh, btop, zed, tmux
+    Dependencies []string // ["fd", "bat"] for fzf — triggers dependency hints in TUI
+    HasCurated   bool     // false if only minimal template exists
+}
+```
+
+This catalog drives: program listing in TUI step 4, schema generation, vim support metadata, dependency hints, and template selection.
+
+---
+
 ## Schema Regeneration
 
 `schema.json` is a generated artifact, not user-authored. innix regenerates it:
 
 - **When:** on add program, remove program, or explicit request
-- **Source of truth:** innix's embedded program catalog (has names, descriptions, vim support metadata) merged with filesystem scan of `dotfiles/` (catches manually added programs)
-- **For custom programs:** if a user manually adds `dotfiles/curated/neovim.nix`, innix detects it on next scan and adds `neovim` to the schema with a generic description. The user can hand-edit the schema for a better description — innix preserves custom entries on regeneration.
+- **Source of truth:** innix's embedded program catalog (names, descriptions, categories, vim support) merged with filesystem scan of `dotfiles/` (catches manually added programs)
+- **For custom programs:** if a user manually adds `dotfiles/curated/neovim.nix`, innix detects it on next scan and adds `neovim` to the schema with a generic description. innix preserves custom entries on regeneration.
+
+### Schema structure (programs section)
+
+```json
+{
+  "programs": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "zsh": {
+        "type": "object",
+        "required": ["config"],
+        "additionalProperties": false,
+        "properties": {
+          "config": { "type": "string", "enum": ["curated", "minimal"] },
+          "vim":    { "type": "boolean", "description": "Override global vim_keybindings for zsh" }
+        },
+        "description": "Shell with history, completions, and syntax highlighting"
+      },
+      "bat": {
+        "type": "object",
+        "required": ["config"],
+        "additionalProperties": false,
+        "properties": {
+          "config": { "type": "string", "enum": ["curated", "minimal"] }
+        },
+        "description": "Syntax-highlighted file viewer"
+      }
+    }
+  }
+}
+```
+
+Programs that support vim get a `vim` boolean property. Programs that don't simply omit it. The `config` field is required for every program table.
 
 ---
 
@@ -655,12 +742,18 @@ Then offer to open GitHub SSH settings page + copy public key to clipboard.
 
 ## Visual Design
 
-- **Dynamic theme matching** — TUI switches to match selected Stylix theme
-- **Wallpaper thumbnails** — go-termimg with Kitty protocol (Ghostty) / half-block fallback
-- **Spring-animated progress bars** — Harmonica during short operations. For long builds (`nix build` 10-30 min), stream build output alongside a spinner rather than just animating.
+### v1
+- **Fixed attractive theme** — Catppuccin-inspired palette, consistent across all screens
+- **Theme preview** — color palette swatches for selected Stylix theme (not live TUI theme switching)
+- **Spinner + streamed build output** — during `nix build` / `darwin-rebuild` (can take 10-30 min)
 - **Gradient borders** — Lipgloss v2 around active panels
 - **ASCII art header** — branded welcome screen
 - **VHS tape file** — for recording demo GIF for README
+
+### v1.1 polish
+- **Dynamic theme matching** — TUI switches to match selected Stylix theme (requires runtime base16 YAML parsing)
+- **Wallpaper thumbnails** — go-termimg with Kitty protocol (Ghostty) / half-block fallback
+- **Spring-animated progress bars** — Harmonica for short operations alongside build output
 
 ---
 
@@ -697,7 +790,7 @@ innix/
 │   └── verify/
 │       └── onepassword.go      # 1Password checks
 ├── templates/                   # Embedded via go:embed
-│   ├── flake.nix.tmpl          # Templated (repo path for rebuild alias)
+│   ├── flake.nix               # Static (rebuild alias path lives in zsh dotfile)
 │   ├── fonts.nix               # Static
 │   ├── modules/
 │   │   ├── common.nix.tmpl     # Templated (only writes configured settings)
@@ -719,14 +812,14 @@ innix/
 
 | File | Templated? | Why |
 |---|---|---|
-| `flake.nix` | Yes | Repo path varies per scaffold location |
+| `flake.nix` | No | Static — rebuild alias path belongs in zsh dotfile, not flake |
 | `common.nix` | Yes | Only writes macOS settings the user configured |
 | `fonts.nix` | No | Same for every repo |
 | `schema.json` | Generated | Built from embedded catalog + filesystem scan |
-| `packages.nix` | No | Same for every repo |
-| `homebrew.nix` | No | Same for every repo |
-| `home.nix` | No | Same for every repo (reads host TOML dynamically) |
-| `dotfiles/curated/*` | No | Same for every repo (reads host attrset dynamically) |
+| `packages.nix` | No | Static template, dynamic at Nix eval time (reads `host` via specialArgs) |
+| `homebrew.nix` | No | Static template, dynamic at Nix eval time (reads `host` via specialArgs) |
+| `home.nix` | No | Static template, dynamic at Nix eval time (reads `host` via specialArgs) |
+| `dotfiles/curated/*` | No | Static templates, dynamic at Nix eval time (reads `host` via specialArgs) |
 | `dotfiles/minimal/*` | No | Same for every repo |
 
 ---
@@ -735,7 +828,7 @@ innix/
 
 The wizard collects ALL answers before writing any files (atomic write at step 8).
 
-**Bootstrap interruption:** If Nix installation requires a shell restart, innix writes a `.innix-resume.json` temp file with progress. On next run, detects it and resumes.
+**Bootstrap interruption:** If Nix installation requires a shell restart, innix writes a resume file to `$TMPDIR/innix-resume.json` containing wizard progress so far. On next `innix` run (in any directory), it detects the resume file and offers to continue. The resume file expires after 24 hours and is cleaned up on successful completion.
 
 **Write interruption:** If the atomic write is interrupted (e.g., Ctrl-C during file creation), the next `innix` run detects a partial repo (has `.innix-version` but missing key files like `flake.nix` or `modules/`) and offers:
 ```
